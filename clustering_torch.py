@@ -17,9 +17,6 @@ def read_files(input_dir):
 def merge_datasets(df1, df2):
     return pd.concat([df1, df2])
 
-###### xxxxx todo : in pairwise_comparison, at testing time, use the whole test data just once instead of bootstrapping    ->  compare bounds  ->  choose the one that has max margin? 
-# todo : pairwise_comparison -> accuracy per pair-> choose the pair with max accuracy -> combine if the accuracy > threshold
-
 class GreedyClustering:
     def __init__(self, df_dict, y_column):
         self.df_dict = df_dict
