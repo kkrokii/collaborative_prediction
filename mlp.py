@@ -24,22 +24,30 @@ def merge_datasets(df1, df2):
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-class MLP(torch.nn.module):
+class MLP(torch.nn.Module):
     def __init__(self, in_features, hidden_features, out_features):
+        super().__init__()
         self.hidden_features = hidden_features
-        self.linear1 = torch.nn.Linear(in_features = in_features, out_features = self.hidden_features)
+        self.main = torch.nn.Sequential(
+            torch.nn.Linear(in_features = in_features, out_features = self.hidden_features),
+            # torch.nn.Linear(in_features = self.hidden_features, out_features = self.hidden_features),
+            # torch.nn.ReLU(),
+            # torch.nn.Linear(in_features = self.hidden_features  , out_features = self.hidden_features),
+            # torch.nn.ReLU()
+        )
         self.relu = torch.nn.ReLU()
-        self.hidden_features = hidden_features
-        self.linear2 = torch.nn.Linear(in_features = self.hidden_features, out_features = out_features)
+        self.linear = torch.nn.Linear(in_features = self.hidden_features, out_features = out_features)
     def forward(self, x):
-        return self.linear2(self.relu(self.linear1(x)))
+        return self.linear(self.relu(self.main(x)))
     def change_linear_layer(self, out_features):
-        self.linear2 = torch.nn.Linear(in_features = self.hidden_features, out_features = out_features)
+        self.linear = torch.nn.Linear(in_features = self.hidden_features, out_features = out_features)
+    def get_representation(self, x):
+        return self.main(x)
 
 def df_loader(df, y_column, batch_size = 64):
     dataset = torch.utils.data.TensorDataset(
-        torch.from_numpy(df.drop(y_column, axis=1).values), 
-        torch.from_numpy(df[[y_column]].values) 
+        torch.from_numpy(df.drop(y_column, axis=1).values.astype(np.float32)).type(torch.FloatTensor), 
+        torch.from_numpy(df[[y_column]].values.astype(np.float32)).type(torch.FloatTensor) 
         )
     dataloader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = True)              # batch_size x in_features, batch_size x 1
     return dataloader
@@ -49,27 +57,49 @@ def training(df_dict, y_column, hidden_features, epochs = 10, lr=1e-4, momentum=
     model = MLP(in_features, hidden_features, out_features = 1).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr = lr, momentum = momentum)
     
-    loss_list = []
     tik = time.time()
+    total_loss_dict = {df_name: [] for df_name in df_dict.keys()}
     for epoch in range(epochs):
-        total_loss = 0
         for df_name, df in df_dict.items():
+            total_loss_dict[df_name].append(0)
             dataloader = df_loader(df, y_column)
             for features, labels in dataloader:                                                                         # batch_size x in_features, batch_size x 1
+                if torch.isnan(features).any() or torch.isnan(labels).any():
+                    print('nan')
+                    exit()
                 features = features.to(device)
                 labels = labels.to(device)
                 
                 outputs = model(features)
-                loss = torch.mean((labels - outputs)**2)
-                total_loss += loss
+                loss = torch.sum((labels - outputs)**2)
+                total_loss_dict[df_name][-1] += loss
                 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+            total_loss_dict[df_name][-1] /= len(df)
 
-        loss_list.append(total_loss)
-        print(f"{epoch}th epoch, total time elapsed: {time.time()-tik}")
-    return model
+        print(f"{epoch}th epoch, total time elapsed: {time.time()-tik}, loss: ", end='\t')
+        total_loss = 0
+        for df_name in df_dict.keys():
+            #print(f"\t {df_name}: {total_loss_dict[df_name][-1]}")
+            total_loss += total_loss_dict[df_name][-1]
+        print(f'{total_loss}')
+    return model, total_loss_dict
+
+def convert_df_to_feature(df_dict, y_column, model):
+    new_df_dict = dict()
+    for df_name, df in df_dict.items():
+        x_feature = []
+        y = torch.from_numpy(df[[y_column]].values).to(device)
+        
+        dataloader = df_loader(df, y_column)
+        for x_batch, _ in dataloader:
+            x_batch = x_batch.to(device)
+            x_feature.append(model.get_representation(x_batch))
+        x_feature = torch.cat(x_feature)
+        new_df_dict[df_name] = pd.DataFrame( torch.cat((y, x_feature), axis=1).detach().cpu().numpy() ).rename(columns={0:y_column})
+    return new_df_dict
 
 class GreedyClustering:
     def __init__(self, df_dict, y_column):
@@ -79,7 +109,7 @@ class GreedyClustering:
         accuracy_dict = {}
         result_dict = {}
         for candidate_df_name, candidate_df in candidate_df_dict.items():
-            print(f"comparison of {current_df_name} with : {candidate_df_name}")
+            print(f"comparison of {current_df_name} ({current_df.shape}) with : {candidate_df_name} ({candidate_df.shape})")
             correct, optimal_alpha, (rhs_bound_list, lhs_bound_list, gt_list) = pairwise_comparison(n1, n2, p, current_df, candidate_df, y_column, train_ratio, estimation_ratio, test_ratio, bound_type)
             accuracy_dict[candidate_df_name] = correct / len(gt_list)
             result_dict[candidate_df_name] = {'correct': correct, 'total': len(gt_list)}
@@ -201,6 +231,11 @@ if __name__=='__main__':
         default=None
     )
     parser.add_argument(
+        '--output_model_name',
+        type=str,
+        default=None
+    )
+    parser.add_argument(
         '--threshold',
         type=float,
         default=0.9
@@ -217,6 +252,18 @@ if __name__=='__main__':
     n2=50
     df_dict = read_files(args.input_dir)
     p=list(df_dict.values())[0].shape[1]-1
+    
+    lr = 1e-4
+    momentum = 0.9
+    hidden_features = 12
+    epochs = 10
+    
+    print(f"input dim: {p}, hidden features: {hidden_features}, lr: {lr}, momentum: {momentum}, training epoch: {epochs}")
+    model, total_loss_dict = training(df_dict, args.y_column, hidden_features = hidden_features, epochs = epochs, lr=lr, momentum=momentum)
+    df_dict = convert_df_to_feature(df_dict, args.y_column, model)
+    p=list(df_dict.values())[0].shape[1]-1
+    print(f"finished training")
+    torch.save(model.state_dict(), args.output_dir + '/' + args.output_model_name)
     
     clusterer = GreedyClustering(df_dict, args.y_column)
     cluster, result = clusterer.clustering(n1, n2, p, train_ratio=0.4, estimation_ratio=0.4, test_ratio=0.2, bound_type=args.bound_type, threshold=args.threshold)
@@ -236,12 +283,17 @@ if __name__=='__main__':
         'bound_type': [args.bound_type],
         'separate_oos_error_sum': [separate_error_sum.cpu()],
         'clustered_oos_error_sum': [clustered_error_sum.cpu()],
+        'lr': [lr],
+        'momentum': [momentum],
+        'epochs': [epochs],
+        'loss_list': [total_loss_dict],
+        'hidden_features': [hidden_features]
         #'clustered_result_by_file': [result],
     })
     output.to_pickle(args.output_dir + '/' + args.output_file)
-    
+        
     print(f"total time elapsed: {time.time() - tick}")
 '''
 ex)
-python clustering_torch.py --output_dir=cluster_output/data2 --output_file=output1.pd --bound_type=1 --y_column=order --input_dir=data2/separate_item_data --threshold=0.9
+python mlp.py --output_dir=mlp_output/mlp_data1 --output_file=output1.pd --bound_type=1 --y_column=Sales --input_dir=mlp_data1/separate_data --threshold=0.9 --output_model_name=model.pth
 '''
