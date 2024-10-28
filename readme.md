@@ -1,4 +1,4 @@
-For experiments on synthetic dataset, run:
+For experiments on synthetic dataset, run:\
     python simulation.py --output_file=output.pd --n1=50 --n2=50 --p=10 --beta_perturbation=1
 
 For experiments on a real-world dataset, 
